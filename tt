@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title RuraSwapAtomizer
+ * @dev Контракт для управления атомарными кросс-роллап свапами.
+ * Использует Hash Time-Lock Contract (HTLC) логику.
+ */
+contract RuraSwapAtomizer {
+    
+    // Структура для хранения деталей обмена
+    struct Swap {
+        address initiator;          // Инициатор обмена (Пользователь A)
+        IERC20 token;              // Токен, который предлагает инициатор
+        uint256 amount;             // Сумма токена
+        bytes32 hashlock;           // Криптографический хэш секрета
+        uint256 expiryTime;         // Время истечения (тайм-лок)
+        address recipient;          // Получатель на внешней сети (Пользователь B)
+        bool claimed;               // Обмен успешно завершен (B забрал A)
+        bool refunded;              // Обмен отменен и средства возвращены (A забрал назад)
+    }
+
+    // Хранение обменов: hashlock => Swap
+    mapping(bytes32 => Swap) public swaps;
+    
+    // События
+    event SwapInitiated(bytes32 indexed hashlock, address indexed initiator, uint256 amount, uint256 expiry);
+    event SwapClaimed(bytes32 indexed hashlock, address indexed recipient);
+    event SwapRefunded(bytes32 indexed hashlock, address indexed initiator);
+
+    // --- 1. ИНИЦИАЦИЯ СВАПА (ШАГ А) ---
+
+    /**
+     * @notice Инициализирует новый атомарный обмен.
+     * @dev Инициатор (A) блокирует свои токены в этом контракте.
+     * @param _token Адрес токена, который предлагает инициатор.
+     * @param _amount Сумма токена.
+     * @param _hashlock Хэш секрета (preimage).
+     * @param _timelock Время, до которого обмен должен быть завершен (в секундах с текущего момента).
+     * @param _recipient Адрес получателя (B) в целевой сети.
+     */
+    function initiateSwap(
+        IERC20 _token,
+        uint256 _amount,
+        bytes32 _hashlock,
+        uint256 _timelock,
+        address _recipient
+    ) external {
+        require(swaps[_hashlock].initiator == address(0), "Swap already exists.");
+        require(_amount > 0, "Amount must be greater than zero.");
+        require(_timelock > 0, "Timelock must be in the future.");
+
+        // 1. Переводим токены инициатора в этот контракт
+        _token.transferFrom(msg.sender, address(this), _amount);
+
+        // 2. Создаем структуру обмена
+        swaps[_hashlock] = Swap({
+            initiator: msg.sender,
+            token: _token,
+            amount: _amount,
+            hashlock: _hashlock,
+            expiryTime: block.timestamp + _timelock,
+            recipient: _recipient,
+            claimed: false,
+            refunded: false
+        });
+
+        emit SwapInitiated(_hashlock, msg.sender, _amount, block.timestamp + _timelock);
+    }
+
+    // --- 2. ЗАВЕРШЕНИЕ СВАПА (ШАГ B - ТОЛЬКО ДЛЯ АВТОМАТИЗАЦИИ) ---
+    
+    // В реальной жизни, этот метод вызывается, когда *Пользователь B* на внешней сети
+    // завершает свою часть, и мы получаем доказательство *секрета* (preimage).
+
+    /**
+     * @notice Завершает обмен и переводит токены получателю (B).
+     * @dev Этот метод вызывается *только* после того, как Пользователь B (recipient)
+     * успешно завершил свою часть сделки на внешней сети и раскрыл секрет.
+     * @param _preimage Секрет, хэш которого соответствует hashlock обмена.
+     */
+    function claimSwap(bytes32 _preimage) external {
+        bytes32 hashlock = sha256(abi.encodePacked(_preimage));
+        Swap storage swap = swaps[hashlock];
+
+        require(swap.initiator != address(0), "Swap not found.");
+        require(hashlock == swap.hashlock, "Invalid preimage.");
+        require(!swap.claimed, "Swap already claimed.");
+        require(block.timestamp < swap.expiryTime, "Swap has expired.");
+
+        // 1. Помечаем как завершенный
+        swap.claimed = true;
+
+        // 2. Переводим заблокированные токены B (recipient)
+        // В упрощенной схеме recipient - это адрес в нашей сети, куда нужно перевести
+        // В сложном кросс-роллап обмене: recipient - это адрес, который получит токены
+        // после получения доказательства раскрытия секрета с другой сети.
+        // Для демонстрации, мы переводим на адрес, указанный в структуре Swap.
+        swap.token.transfer(swap.recipient, swap.amount);
+
+        emit SwapClaimed(hashlock, swap.recipient);
+    }
+
+    // --- 3. ВОЗВРАТ СРЕДСТВ (ШАГ C) ---
+
+    /**
+     * @notice Позволяет инициатору (A) вернуть свои токены, если истек тайм-лок.
+     * @param _hashlock Хэш, связанный с обменом.
+     */
+    function refundSwap(bytes32 _hashlock) external {
+        Swap storage swap = swaps[_hashlock];
+
+        require(swap.initiator != address(0), "Swap not found.");
+        require(msg.sender == swap.initiator, "Only initiator can refund.");
+        require(!swap.claimed, "Swap already claimed.");
+        require(!swap.refunded, "Swap already refunded.");
+        // Требование тайм-лока:
+        require(block.timestamp >= swap.expiryTime, "Timelock not yet expired.");
+
+        // 1. Помечаем как возвращенный
+        swap.refunded = true;
+
+        // 2. Возвращаем токены инициатору
+        swap.token.transfer(swap.initiator, swap.amount);
+
+        emit SwapRefunded(_hashlock, swap.initiator);
+    }
+}
