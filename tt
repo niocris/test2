@@ -103,7 +103,7 @@ contract RuraSwapAtomizer {
         emit SwapClaimed(hashlock, swap.recipient);
     }
 
-    // --- 3. ВОЗВРАТ СРЕДСТВ (ШАГ C) ---
+    // -- 3. ВОЗВРАТ СРЕДСТВ (ШАГ C) --
 
     /**
      * @notice Позволяет инициатору (A) вернуть свои токены, если истек тайм-лок.
